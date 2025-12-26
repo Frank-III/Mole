@@ -16,6 +16,7 @@ pub const clean = @import("clean/mod.zig");
 pub const scanner = @import("analyze/scanner.zig");
 pub const metrics = @import("status/metrics.zig");
 pub const uninstall = @import("uninstall/detector.zig");
+pub const optimize = @import("optimize/tasks.zig");
 
 const VERSION = "2.0.0-zig";
 const AUTHOR = "Tw93 & Contributors";
@@ -237,8 +238,7 @@ pub fn main() !void {
             try runPurge(allocator, path, app_config.project_cleanup_depth, dry_run, skip_confirm);
         },
         .optimize => {
-            try stdout.writeAll("\n⚡ System Optimization\n");
-            try stdout.writeAll("(Optimization coming soon...)\n\n");
+            try runOptimize(allocator, skip_confirm);
         },
         .check => {
             try stdout.writeAll("\n🔍 System Health Check\n\n");
@@ -555,6 +555,70 @@ fn runUninstall(allocator: std.mem.Allocator, app_name: []const u8, dry_run: boo
         }
     } else {
         try stdout.writeAll("\nMultiple apps found. Please specify a more specific name.\n");
+    }
+}
+
+/// Run system optimization
+fn runOptimize(allocator: std.mem.Allocator, skip_confirm: bool) !void {
+    const stdout = io.getStdOut().writer();
+
+    try stdout.writeAll("\n⚡ System Optimization\n\n");
+
+    // Show available tasks
+    try optimize.printTasks(stdout);
+
+    try stdout.writeAll("\nOptions:\n");
+    try stdout.writeAll("  1. Quick optimization (fast, no sudo)\n");
+    try stdout.writeAll("  2. Full optimization (all tasks, requires sudo)\n");
+    try stdout.writeAll("  3. Cancel\n\n");
+
+    if (!skip_confirm) {
+        try stdout.writeAll("Choose option [1/2/3]: ");
+
+        const stdin = io.getStdIn().reader();
+        var buf: [10]u8 = undefined;
+        const input = stdin.readUntilDelimiter(&buf, '\n') catch "";
+
+        if (input.len == 0 or input[0] == '3') {
+            try stdout.writeAll("Cancelled.\n");
+            return;
+        }
+
+        if (input[0] == '1') {
+            try stdout.writeAll("\nRunning quick optimization...\n\n");
+
+            var results = try optimize.quickOptimize(allocator);
+            defer {
+                for (results.items) |*r| r.deinit();
+                results.deinit();
+            }
+
+            try optimize.printResults(results.items, stdout);
+        } else if (input[0] == '2') {
+            try stdout.writeAll("\nRunning full optimization (this may take a while)...\n\n");
+            try stdout.writeAll("⚠️  Some tasks require sudo. You may be prompted for your password.\n\n");
+
+            var results = try optimize.runAll(allocator, true, false);
+            defer {
+                for (results.items) |*r| r.deinit();
+                results.deinit();
+            }
+
+            try optimize.printResults(results.items, stdout);
+        } else {
+            try stdout.writeAll("Invalid option. Cancelled.\n");
+        }
+    } else {
+        // Auto mode - run quick optimization
+        try stdout.writeAll("Running quick optimization...\n\n");
+
+        var results = try optimize.quickOptimize(allocator);
+        defer {
+            for (results.items) |*r| r.deinit();
+            results.deinit();
+        }
+
+        try optimize.printResults(results.items, stdout);
     }
 }
 
