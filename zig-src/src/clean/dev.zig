@@ -548,10 +548,10 @@ pub const ProjectArtifact = enum {
     dist,
     out,
     venv,
-    __pycache__,
-    .next,
-    .nuxt,
-    .cache,
+    pycache,
+    next,
+    nuxt,
+    cache,
     coverage,
 
     pub fn displayName(self: ProjectArtifact) []const u8 {
@@ -562,10 +562,10 @@ pub const ProjectArtifact = enum {
             .dist => "dist",
             .out => "out",
             .venv => "venv (Python)",
-            .__pycache__ => "__pycache__",
-            .@".next" => ".next (Next.js)",
-            .@".nuxt" => ".nuxt (Nuxt.js)",
-            .@".cache" => ".cache",
+            .pycache => "__pycache__",
+            .next => ".next (Next.js)",
+            .nuxt => ".nuxt (Nuxt.js)",
+            .cache => ".cache",
             .coverage => "coverage",
         };
     }
@@ -578,10 +578,10 @@ pub const ProjectArtifact = enum {
             .dist => "dist",
             .out => "out",
             .venv => "venv",
-            .__pycache__ => "__pycache__",
-            .@".next" => ".next",
-            .@".nuxt" => ".nuxt",
-            .@".cache" => ".cache",
+            .pycache => "__pycache__",
+            .next => ".next",
+            .nuxt => ".nuxt",
+            .cache => ".cache",
             .coverage => "coverage",
         };
     }
