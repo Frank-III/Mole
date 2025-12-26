@@ -12,6 +12,11 @@ pub const config = @import("core/config.zig");
 // Cleanup modules
 pub const clean = @import("clean/mod.zig");
 
+// Feature modules
+pub const scanner = @import("analyze/scanner.zig");
+pub const metrics = @import("status/metrics.zig");
+pub const uninstall = @import("uninstall/detector.zig");
+
 const VERSION = "2.0.0-zig";
 const AUTHOR = "Tw93 & Contributors";
 
@@ -210,19 +215,14 @@ pub fn main() !void {
                 const home = std.posix.getenv("HOME") orelse "/";
                 break :blk home;
             };
-            try stdout.print("\n📊 Analyzing: {s}\n", .{path});
-            try stdout.writeAll("(TUI analyzer coming soon...)\n\n");
-            // TODO: Implement TUI analyzer
+            try runAnalyze(allocator, path);
         },
         .status => {
-            try stdout.writeAll("\n📈 System Status Monitor\n");
-            try stdout.writeAll("(TUI monitor coming soon...)\n\n");
-            // TODO: Implement TUI status monitor
+            try runStatus(allocator);
         },
         .uninstall => {
             if (target_path) |app_name| {
-                try stdout.print("\n🗑️  Uninstalling: {s}\n", .{app_name});
-                try stdout.writeAll("(App uninstaller coming soon...)\n\n");
+                try runUninstall(allocator, app_name, dry_run, skip_confirm);
             } else {
                 try stderr.writeAll("Error: Please specify an app name\n");
                 try stderr.writeAll("Usage: mole uninstall <app-name>\n");
@@ -445,6 +445,117 @@ fn showConfig(app_config: *const config.Config, writer: anytype) !void {
     }
 
     try writer.writeAll("\n");
+}
+
+/// Run disk analyzer
+fn runAnalyze(allocator: std.mem.Allocator, path: []const u8) !void {
+    const stdout = io.getStdOut().writer();
+
+    try stdout.writeAll("\n📊 Disk Space Analyzer\n\n");
+
+    // Check if analyzing home or specific path
+    if (mem.eql(u8, path, std.posix.getenv("HOME") orelse "/")) {
+        try stdout.writeAll("Scanning system overview...\n");
+
+        var overview = try scanner.getSystemOverview(allocator);
+        defer {
+            for (overview.items) |*e| {
+                e.deinit();
+            }
+            overview.deinit();
+        }
+
+        try scanner.printOverview(overview.items, stdout);
+    } else {
+        try stdout.print("Scanning: {s}\n", .{path});
+
+        var result = try scanner.scanDirectory(allocator, path, .{});
+        defer result.deinit();
+
+        try scanner.printResults(&result, stdout);
+    }
+}
+
+/// Run system status
+fn runStatus(allocator: std.mem.Allocator) !void {
+    const stdout = io.getStdOut().writer();
+
+    var status = try metrics.collectStatus(allocator);
+    defer status.deinit();
+
+    try metrics.printStatus(&status, stdout);
+}
+
+/// Run app uninstaller
+fn runUninstall(allocator: std.mem.Allocator, app_name: []const u8, dry_run: bool, skip_confirm: bool) !void {
+    const stdout = io.getStdOut().writer();
+
+    try stdout.print("\n🗑️  Searching for: {s}\n\n", .{app_name});
+
+    // Find matching apps
+    var apps = try uninstall.findApps(allocator, app_name);
+    defer {
+        for (apps.items) |*app| {
+            app.deinit();
+        }
+        apps.deinit();
+    }
+
+    if (apps.items.len == 0) {
+        try stdout.print("No applications matching '{s}' found.\n", .{app_name});
+        return;
+    }
+
+    // Show found apps
+    try uninstall.printAppList(apps.items, stdout);
+
+    if (apps.items.len == 1) {
+        const app = &apps.items[0];
+
+        // Check if protected
+        if (uninstall.isProtectedApp(app.name, app.bundle_id)) {
+            try stdout.writeAll("\n⚠️  This application is protected and cannot be uninstalled.\n");
+            return;
+        }
+
+        try uninstall.printAppInfo(app, stdout);
+
+        if (dry_run) {
+            try stdout.writeAll("\nDry run - no files would be deleted.\n");
+            return;
+        }
+
+        if (!skip_confirm) {
+            try stdout.writeAll("\nUninstall this application? [y/N] ");
+
+            const stdin = io.getStdIn().reader();
+            var buf: [10]u8 = undefined;
+            const input = stdin.readUntilDelimiter(&buf, '\n') catch "";
+
+            if (input.len == 0 or (input[0] != 'y' and input[0] != 'Y')) {
+                try stdout.writeAll("Cancelled.\n");
+                return;
+            }
+        }
+
+        try stdout.writeAll("\nUninstalling...\n");
+
+        var result = try uninstall.uninstallApp(allocator, app, true, false);
+        defer result.deinit();
+
+        if (result.success) {
+            const formatted = file_ops.formatBytes(result.bytes_freed);
+            try stdout.print("\n✅ Uninstalled {s}. Freed {d:.2} {s}\n", .{
+                app.name,
+                formatted.value,
+                formatted.unit,
+            });
+        } else {
+            try stdout.writeAll("\n❌ Failed to uninstall. Check errors above.\n");
+        }
+    } else {
+        try stdout.writeAll("\nMultiple apps found. Please specify a more specific name.\n");
+    }
 }
 
 // ============================================================================
