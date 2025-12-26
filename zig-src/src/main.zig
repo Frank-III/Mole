@@ -17,6 +17,7 @@ pub const scanner = @import("analyze/scanner.zig");
 pub const metrics = @import("status/metrics.zig");
 pub const uninstall = @import("uninstall/detector.zig");
 pub const optimize = @import("optimize/tasks.zig");
+pub const touchid = @import("touchid/config.zig");
 
 const VERSION = "2.0.0-zig";
 const AUTHOR = "Tw93 & Contributors";
@@ -31,6 +32,7 @@ const Command = enum {
     uninstall,
     purge,
     optimize,
+    touchid_cmd,
     check,
     config_cmd,
     unknown,
@@ -55,6 +57,8 @@ const Command = enum {
             .{ "p", Command.purge },
             .{ "optimize", Command.optimize },
             .{ "o", Command.optimize },
+            .{ "touchid", Command.touchid_cmd },
+            .{ "tid", Command.touchid_cmd },
             .{ "check", Command.check },
             .{ "config", Command.config_cmd },
         };
@@ -95,11 +99,12 @@ fn printHelp(writer: anytype) !void {
         \\
         \\COMMANDS:
         \\  clean, c       Deep clean system caches, logs, and temp files
-        \\  analyze, a     Interactive disk space analyzer (TUI)
-        \\  status, s      Real-time system status monitor (TUI)
+        \\  analyze, a     Disk space analyzer
+        \\  status, s      System status monitor
         \\  uninstall, u   Smart app uninstaller with orphan detection
         \\  purge, p       Clean project build artifacts (node_modules, target, etc.)
         \\  optimize, o    System maintenance and optimization
+        \\  touchid, tid   Configure Touch ID for sudo
         \\  check          System health check
         \\  config         Manage configuration (whitelist, blacklist)
         \\  help, -h       Show this help message
@@ -239,6 +244,9 @@ pub fn main() !void {
         },
         .optimize => {
             try runOptimize(allocator, skip_confirm);
+        },
+        .touchid_cmd => {
+            try runTouchId(allocator, target_path);
         },
         .check => {
             try stdout.writeAll("\n🔍 System Health Check\n\n");
@@ -555,6 +563,50 @@ fn runUninstall(allocator: std.mem.Allocator, app_name: []const u8, dry_run: boo
         }
     } else {
         try stdout.writeAll("\nMultiple apps found. Please specify a more specific name.\n");
+    }
+}
+
+/// Run Touch ID configuration
+fn runTouchId(allocator: std.mem.Allocator, action: ?[]const u8) !void {
+    const stdout = io.getStdOut().writer();
+
+    // Get current status
+    const status = try touchid.getStatus(allocator);
+
+    if (action) |act| {
+        if (mem.eql(u8, act, "enable")) {
+            try stdout.writeAll("\n🔐 Enabling Touch ID for sudo...\n\n");
+
+            var result = try touchid.enable(allocator);
+            defer result.deinit();
+
+            if (result.success) {
+                try stdout.print("✅ {s}\n", .{result.message orelse "Done"});
+            } else {
+                try stdout.print("❌ {s}\n", .{result.message orelse "Failed"});
+            }
+        } else if (mem.eql(u8, act, "disable")) {
+            try stdout.writeAll("\n🔐 Disabling Touch ID for sudo...\n\n");
+
+            var result = try touchid.disable(allocator);
+            defer result.deinit();
+
+            if (result.success) {
+                try stdout.print("✅ {s}\n", .{result.message orelse "Done"});
+            } else {
+                try stdout.print("❌ {s}\n", .{result.message orelse "Failed"});
+            }
+        } else {
+            try stdout.print("Unknown action: {s}\n", .{act});
+            try stdout.writeAll("Usage: mole touchid [enable|disable]\n");
+        }
+    } else {
+        // Just show status
+        try touchid.printStatus(status, stdout);
+
+        try stdout.writeAll("Commands:\n");
+        try stdout.writeAll("  mole touchid enable   - Enable Touch ID for sudo\n");
+        try stdout.writeAll("  mole touchid disable  - Disable Touch ID for sudo\n");
     }
 }
 
