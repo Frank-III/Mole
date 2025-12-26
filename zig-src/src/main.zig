@@ -9,6 +9,9 @@ pub const file_ops = @import("core/file_ops.zig");
 pub const logging = @import("core/logging.zig");
 pub const config = @import("core/config.zig");
 
+// Cleanup modules
+pub const clean = @import("clean/mod.zig");
+
 const VERSION = "2.0.0-zig";
 const AUTHOR = "Tw93 & Contributors";
 
@@ -200,7 +203,7 @@ pub fn main() !void {
             if (dry_run) {
                 try stdout.writeAll("Running in DRY-RUN mode - no files will be deleted\n\n");
             }
-            try runClean(allocator, &app_config, dry_run, skip_confirm);
+            try runCleanComprehensive(allocator, &app_config, dry_run, skip_confirm);
         },
         .analyze => {
             const path = target_path orelse blk: {
@@ -226,8 +229,12 @@ pub fn main() !void {
             }
         },
         .purge => {
-            try stdout.writeAll("\n🧹 Project Artifact Purge\n");
-            try stdout.writeAll("(Project purge coming soon...)\n\n");
+            try stdout.writeAll("\n🧹 Project Artifact Purge\n\n");
+            const path = target_path orelse blk: {
+                const home = std.posix.getenv("HOME") orelse "/";
+                break :blk home;
+            };
+            try runPurge(allocator, path, app_config.project_cleanup_depth, dry_run, skip_confirm);
         },
         .optimize => {
             try stdout.writeAll("\n⚡ System Optimization\n");
@@ -248,89 +255,29 @@ pub fn main() !void {
     }
 }
 
-/// Run the clean command
-fn runClean(allocator: std.mem.Allocator, app_config: *config.Config, dry_run: bool, skip_confirm: bool) !void {
+/// Run comprehensive cleanup using all cleanup modules
+fn runCleanComprehensive(allocator: std.mem.Allocator, app_config: *config.Config, dry_run: bool, skip_confirm: bool) !void {
     const stdout = io.getStdOut().writer();
 
-    // Define cleanup targets
-    const CleanTarget = struct {
-        name: []const u8,
-        path_template: []const u8,
-        description: []const u8,
-    };
+    try stdout.writeAll("Scanning all cleanup targets...\n");
 
-    const targets = [_]CleanTarget{
-        .{ .name = "User Caches", .path_template = "{s}/Library/Caches", .description = "Application cache files" },
-        .{ .name = "User Logs", .path_template = "{s}/Library/Logs", .description = "Application log files" },
-        .{ .name = "Xcode DerivedData", .path_template = "{s}/Library/Developer/Xcode/DerivedData", .description = "Xcode build artifacts" },
-        .{ .name = "npm Cache", .path_template = "{s}/.npm/_cacache", .description = "npm package cache" },
-        .{ .name = "Yarn Cache", .path_template = "{s}/.yarn/cache", .description = "Yarn package cache" },
-        .{ .name = "pip Cache", .path_template = "{s}/.cache/pip", .description = "Python pip cache" },
-        .{ .name = "Cargo Cache", .path_template = "{s}/.cargo/registry/cache", .description = "Rust cargo cache" },
-        .{ .name = "Go Cache", .path_template = "{s}/.cache/go-build", .description = "Go build cache" },
-        .{ .name = "Homebrew Cache", .path_template = "{s}/Library/Caches/Homebrew", .description = "Homebrew download cache" },
-    };
+    // Scan using comprehensive cleanup module
+    var scan_result = try clean.scan(allocator, .{
+        .mode = .standard,
+        .dry_run = dry_run,
+        .include_dev_tools = true,
+        .include_browser = false, // Only include if user explicitly requests
+        .app_config = app_config,
+    });
+    defer scan_result.deinit();
 
-    const home = std.posix.getenv("HOME") orelse {
-        logging.err("Could not determine home directory", .{});
-        return;
-    };
+    // Print summary
+    try clean.printSummary(&scan_result, stdout);
 
-    var total_size: u64 = 0;
-    var total_files: u64 = 0;
-
-    try stdout.writeAll("Scanning cleanup targets...\n\n");
-
-    // Scan each target
-    for (targets) |target| {
-        const path = try std.fmt.allocPrint(allocator, target.path_template, .{home});
-        defer allocator.free(path);
-
-        // Check if whitelisted
-        if (app_config.isWhitelisted(path)) {
-            try stdout.print("  ⏭️  {s}: skipped (whitelisted)\n", .{target.name});
-            continue;
-        }
-
-        // Validate path
-        safety.validatePath(path) catch {
-            try stdout.print("  ❌ {s}: blocked (safety)\n", .{target.name});
-            continue;
-        };
-
-        // Check if exists
-        if (!file_ops.pathExists(path)) {
-            try stdout.print("  ⚪ {s}: not found\n", .{target.name});
-            continue;
-        }
-
-        // Calculate size
-        const size = file_ops.calculateDirectorySize(allocator, path) catch 0;
-        if (size == 0) {
-            try stdout.print("  ⚪ {s}: empty\n", .{target.name});
-            continue;
-        }
-
-        const formatted = file_ops.formatBytes(size);
-        try stdout.print("  ✅ {s}: {d:.2} {s}\n", .{ target.name, formatted.value, formatted.unit });
-
-        total_size += size;
-        total_files += 1;
-    }
-
-    try stdout.writeAll("\n");
-
-    if (total_files == 0) {
+    if (scan_result.total_bytes_freed == 0) {
         try stdout.writeAll("Nothing to clean!\n");
         return;
     }
-
-    const total_formatted = file_ops.formatBytes(total_size);
-    try stdout.print("Total reclaimable: {d:.2} {s} across {d} locations\n\n", .{
-        total_formatted.value,
-        total_formatted.unit,
-        total_files,
-    });
 
     if (dry_run) {
         try stdout.writeAll("Dry run complete - no files were deleted.\n");
@@ -351,37 +298,105 @@ fn runClean(allocator: std.mem.Allocator, app_config: *config.Config, dry_run: b
         }
     }
 
-    try stdout.writeAll("\nCleaning...\n");
+    try stdout.writeAll("\nCleaning...\n\n");
 
-    // Perform cleanup
-    for (targets) |target| {
-        const path = try std.fmt.allocPrint(allocator, target.path_template, .{home});
-        defer allocator.free(path);
+    // Execute cleanup
+    var result = try clean.execute(allocator, &scan_result, false);
+    defer result.deinit();
 
-        if (app_config.isWhitelisted(path)) continue;
-        if (!file_ops.pathExists(path)) continue;
+    const formatted = file_ops.formatBytes(result.bytes_freed);
+    try stdout.print("\n✅ Cleanup complete! Freed {d:.2} {s}\n", .{
+        formatted.value,
+        formatted.unit,
+    });
+}
 
-        var result = file_ops.safeDeleteDirectory(allocator, path, .{
+/// Run project artifact purge
+fn runPurge(allocator: std.mem.Allocator, path: []const u8, max_depth: u32, dry_run: bool, skip_confirm: bool) !void {
+    const stdout = io.getStdOut().writer();
+
+    try stdout.print("Scanning for project artifacts in: {s}\n", .{path});
+    try stdout.print("Max depth: {d}\n\n", .{max_depth});
+
+    // Scan for project artifacts
+    var artifacts = try clean.dev.scanProjectArtifacts(allocator, path, max_depth);
+    defer {
+        for (artifacts.items) |*a| {
+            a.deinit();
+        }
+        artifacts.deinit();
+    }
+
+    if (artifacts.items.len == 0) {
+        try stdout.writeAll("No project artifacts found.\n");
+        return;
+    }
+
+    // Print found artifacts
+    try clean.dev.printProjectArtifacts(artifacts.items, stdout);
+
+    // Calculate reclaimable (excluding recent projects)
+    var reclaimable: u64 = 0;
+    var reclaimable_count: u64 = 0;
+    for (artifacts.items) |a| {
+        if (!a.is_recent) {
+            reclaimable += a.size;
+            reclaimable_count += 1;
+        }
+    }
+
+    if (reclaimable == 0) {
+        try stdout.writeAll("\nAll projects are recent (<7 days). Nothing to clean.\n");
+        return;
+    }
+
+    if (dry_run) {
+        try stdout.writeAll("\nDry run complete - no files were deleted.\n");
+        return;
+    }
+
+    // Confirmation
+    if (!skip_confirm) {
+        try stdout.writeAll("\nProceed with cleanup? [y/N] ");
+
+        const stdin = io.getStdIn().reader();
+        var buf: [10]u8 = undefined;
+        const input = stdin.readUntilDelimiter(&buf, '\n') catch "";
+
+        if (input.len == 0 or (input[0] != 'y' and input[0] != 'Y')) {
+            try stdout.writeAll("Cancelled.\n");
+            return;
+        }
+    }
+
+    try stdout.writeAll("\nPurging...\n");
+
+    var total_freed: u64 = 0;
+    for (artifacts.items) |a| {
+        if (a.is_recent) continue;
+
+        var result = file_ops.safeDeleteDirectory(allocator, a.path, .{
             .dry_run = false,
             .skip_confirmation = true,
         }) catch continue;
         defer result.deinit();
 
         if (result.success) {
+            total_freed += result.bytes_freed;
             const formatted = file_ops.formatBytes(result.bytes_freed);
             logging.success("{s}: freed {d:.2} {s}", .{
-                target.name,
+                a.path,
                 formatted.value,
                 formatted.unit,
             });
-        } else {
-            for (result.errors.items) |err| {
-                logging.err("{s}: {s}", .{ err.path, err.message });
-            }
         }
     }
 
-    try stdout.writeAll("\nCleanup complete!\n");
+    const total_formatted = file_ops.formatBytes(total_freed);
+    try stdout.print("\n✅ Purge complete! Freed {d:.2} {s}\n", .{
+        total_formatted.value,
+        total_formatted.unit,
+    });
 }
 
 /// Run health check
