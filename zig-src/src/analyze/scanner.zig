@@ -8,6 +8,9 @@ const safety = @import("../core/safety.zig");
 const file_ops = @import("../core/file_ops.zig");
 const logging = @import("../core/logging.zig");
 
+// Re-export pool for parallel scanning
+pub const pool = @import("pool.zig");
+
 const log = logging.scoped("analyze");
 
 /// Entry in the directory scan
@@ -456,6 +459,243 @@ pub fn printOverview(entries: []const DirEntry, writer: anytype) !void {
 
     const total_fmt = file_ops.formatBytes(total);
     try writer.print("\nTotal Scanned: {d:.2} {s}\n", .{ total_fmt.value, total_fmt.unit });
+}
+
+// ============================================================================
+// Parallel Scanning Support
+// ============================================================================
+
+/// Parallel scan result with timing information
+pub const ParallelScanSummary = struct {
+    total_size: u64,
+    file_count: u64,
+    dir_count: u64,
+    scan_time_ms: u64,
+    worker_count: u32,
+    entries: std.ArrayList(DirEntry),
+    allocator: Allocator,
+
+    pub fn deinit(self: *ParallelScanSummary) void {
+        for (self.entries.items) |*e| {
+            e.deinit();
+        }
+        self.entries.deinit();
+    }
+};
+
+/// Scan a directory using parallel workers for improved performance
+pub fn scanDirectoryParallel(allocator: Allocator, path: []const u8, cfg: ScanConfig) !ParallelScanSummary {
+    const start_time = std.time.milliTimestamp();
+
+    // Validate path
+    try safety.validatePath(path);
+
+    const worker_count = pool.getOptimalWorkerCount();
+
+    var scanner_pool = try pool.ScannerPool.init(allocator, worker_count);
+    defer scanner_pool.deinit();
+
+    try scanner_pool.scan(path, cfg.max_depth, cfg.show_hidden);
+
+    const results = scanner_pool.getResults();
+    const end_time = std.time.milliTimestamp();
+
+    // Convert pool results to DirEntry format for display
+    var entries = std.ArrayList(DirEntry).init(allocator);
+    errdefer {
+        for (entries.items) |*e| {
+            e.deinit();
+        }
+        entries.deinit();
+    }
+
+    // Group and aggregate by top-level directories
+    var dir_sizes = std.StringHashMap(u64).init(allocator);
+    defer dir_sizes.deinit();
+
+    for (results.entries) |scan_result| {
+        // Extract the first component after the root path
+        const relative = if (mem.startsWith(u8, scan_result.path, path))
+            scan_result.path[path.len..]
+        else
+            scan_result.path;
+
+        // Skip leading slash
+        const trimmed = if (relative.len > 0 and relative[0] == '/')
+            relative[1..]
+        else
+            relative;
+
+        // Get first directory component
+        const first_slash = mem.indexOf(u8, trimmed, "/");
+        const top_dir = if (first_slash) |idx|
+            trimmed[0..idx]
+        else
+            trimmed;
+
+        if (top_dir.len == 0) continue;
+
+        // Aggregate sizes
+        const existing = dir_sizes.get(top_dir) orelse 0;
+        try dir_sizes.put(top_dir, existing + scan_result.size);
+    }
+
+    // Convert to DirEntry list
+    var iter = dir_sizes.iterator();
+    while (iter.next()) |entry| {
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.key_ptr.* });
+
+        try entries.append(.{
+            .name = try allocator.dupe(u8, entry.key_ptr.*),
+            .path = full_path,
+            .size = entry.value_ptr.*,
+            .is_dir = true,
+            .child_count = 0,
+            .allocator = allocator,
+        });
+    }
+
+    // Sort by size
+    std.mem.sort(DirEntry, entries.items, {}, DirEntry.compareBySize);
+
+    // Trim to max entries
+    while (entries.items.len > cfg.max_entries) {
+        var e = entries.pop();
+        e.deinit();
+    }
+
+    return .{
+        .total_size = results.total_size,
+        .file_count = results.total_files,
+        .dir_count = results.total_dirs,
+        .scan_time_ms = @intCast(@max(0, end_time - start_time)),
+        .worker_count = worker_count,
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
+
+/// Get system overview using parallel scanning
+pub fn getSystemOverviewParallel(allocator: Allocator) !ParallelScanSummary {
+    const start_time = std.time.milliTimestamp();
+    const home = std.posix.getenv("HOME") orelse "/";
+
+    var entries = std.ArrayList(DirEntry).init(allocator);
+    errdefer {
+        for (entries.items) |*e| {
+            e.deinit();
+        }
+        entries.deinit();
+    }
+
+    var total_size: u64 = 0;
+    var total_files: u64 = 0;
+    var total_dirs: u64 = 0;
+
+    const worker_count = pool.getOptimalWorkerCount();
+
+    const overview_paths = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "Documents", .path = "/Documents" },
+        .{ .name = "Downloads", .path = "/Downloads" },
+        .{ .name = "Desktop", .path = "/Desktop" },
+        .{ .name = "Pictures", .path = "/Pictures" },
+        .{ .name = "Music", .path = "/Music" },
+        .{ .name = "Movies", .path = "/Movies" },
+        .{ .name = "Library", .path = "/Library" },
+    };
+
+    // Scan each directory in parallel using the pool
+    for (overview_paths) |item| {
+        const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, item.path });
+        errdefer allocator.free(full_path);
+
+        if (!file_ops.pathExists(full_path)) {
+            allocator.free(full_path);
+            continue;
+        }
+
+        // Use parallel scan for each directory
+        const scan_result = pool.parallelScan(allocator, full_path, 10) catch |err| {
+            log.debug("Failed to scan {s}: {s}", .{ full_path, @errorName(err) });
+            allocator.free(full_path);
+            continue;
+        };
+
+        try entries.append(.{
+            .name = try allocator.dupe(u8, item.name),
+            .path = full_path,
+            .size = scan_result.total_size,
+            .is_dir = true,
+            .child_count = scan_result.file_count,
+            .allocator = allocator,
+        });
+
+        total_size += scan_result.total_size;
+        total_files += scan_result.file_count;
+        total_dirs += scan_result.dir_count;
+    }
+
+    // Sort by size
+    std.mem.sort(DirEntry, entries.items, {}, DirEntry.compareBySize);
+
+    const end_time = std.time.milliTimestamp();
+
+    return .{
+        .total_size = total_size,
+        .file_count = total_files,
+        .dir_count = total_dirs,
+        .scan_time_ms = @intCast(@max(0, end_time - start_time)),
+        .worker_count = worker_count,
+        .entries = entries,
+        .allocator = allocator,
+    };
+}
+
+/// Print parallel scan results
+pub fn printParallelResults(result: *const ParallelScanSummary, writer: anytype) !void {
+    const total_fmt = file_ops.formatBytes(result.total_size);
+
+    try writer.writeAll("\n══════════════════════════════════════════════════════\n");
+    try writer.writeAll("              DISK SPACE OVERVIEW (Parallel)\n");
+    try writer.writeAll("══════════════════════════════════════════════════════\n\n");
+
+    try writer.print("Total Size: {d:.2} {s}\n", .{ total_fmt.value, total_fmt.unit });
+    try writer.print("Files: {d}  |  Directories: {d}\n", .{ result.file_count, result.dir_count });
+    try writer.print("Scan Time: {d}ms  |  Workers: {d}\n\n", .{ result.scan_time_ms, result.worker_count });
+
+    try writer.writeAll("Directory Sizes:\n");
+    try writer.writeAll("─────────────────────────────────────────────────────\n");
+
+    for (result.entries.items) |entry| {
+        const size_fmt = file_ops.formatBytes(entry.size);
+        const percentage = if (result.total_size > 0)
+            @as(f64, @floatFromInt(entry.size)) / @as(f64, @floatFromInt(result.total_size)) * 100
+        else
+            0;
+
+        try writer.print("📁 {s:<15} {d:>8.2} {s:<2} ", .{
+            entry.name,
+            size_fmt.value,
+            size_fmt.unit,
+        });
+
+        // Draw bar
+        const bar_width: usize = 25;
+        const filled = @as(usize, @intFromFloat(percentage / 100 * @as(f64, @floatFromInt(bar_width))));
+
+        try writer.writeAll("[");
+        var j: usize = 0;
+        while (j < bar_width) : (j += 1) {
+            if (j < filled) {
+                try writer.writeAll("█");
+            } else {
+                try writer.writeAll("░");
+            }
+        }
+        try writer.print("] {d:>5.1}%\n", .{percentage});
+    }
+
+    try writer.writeAll("\n");
 }
 
 // ============================================================================

@@ -463,24 +463,21 @@ fn runAnalyze(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Check if analyzing home or specific path
     if (mem.eql(u8, path, std.posix.getenv("HOME") orelse "/")) {
-        try stdout.writeAll("Scanning system overview...\n");
+        try stdout.writeAll("Scanning system overview (parallel)...\n");
 
-        var overview = try scanner.getSystemOverview(allocator);
-        defer {
-            for (overview.items) |*e| {
-                e.deinit();
-            }
-            overview.deinit();
-        }
+        // Use parallel scanning for better performance
+        var overview = try scanner.getSystemOverviewParallel(allocator);
+        defer overview.deinit();
 
-        try scanner.printOverview(overview.items, stdout);
+        try scanner.printParallelResults(&overview, stdout);
     } else {
-        try stdout.print("Scanning: {s}\n", .{path});
+        try stdout.print("Scanning: {s} (parallel)...\n", .{path});
 
-        var result = try scanner.scanDirectory(allocator, path, .{});
+        // Use parallel scanning for large directories
+        var result = try scanner.scanDirectoryParallel(allocator, path, .{});
         defer result.deinit();
 
-        try scanner.printResults(&result, stdout);
+        try scanner.printParallelResults(&result, stdout);
     }
 }
 
